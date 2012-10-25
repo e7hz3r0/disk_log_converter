@@ -1,0 +1,44 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%%! -smp enable -sname disk_log_converter
+
+main(Args) when (is_list(Args)) and (length(Args) == 2) ->
+	InFile = hd(Args),
+	[OutFile] = tl(Args),
+	convert_file(InFile, OutFile);
+
+main(_) -> 
+	usage().
+
+usage() ->
+	io:format("usage: disk_log_converter <log to convert> <file to write output to>~n"),
+	halt(1).
+
+convert_file(InFile, OutFile) -> 
+	io:format("Converting ~p from disk_log internal format to human-readable and outputing result to ~p~n", [InFile, OutFile]),
+	Log = case disk_log:open([{name, log},
+				   {file, InFile},
+				   {repair, true}]) of
+		{ok, L} -> L;
+		{repaired, L, _, _} -> L;
+		Error -> 
+			io:format("ERROR: ~p~n", [Error]),
+			undefined
+		end,
+	{ok, File} = file:open(OutFile, [write]),
+	run_conversion(disk_log:chunk(Log, start), Log, File).
+
+run_conversion(eof, Log, File) ->
+	io:format("DONE~n"),
+	disk_log:close(Log),
+	file:close(File);
+
+run_conversion({Continuation, Terms}, Log, File) ->
+	write_terms(Terms, File),
+	run_conversion(disk_log:chunk(Log, Continuation), Log, File).
+
+write_terms([], _) -> ok;
+write_terms([Term | Terms], File)->
+	io:format("."),
+	ok = file:write(File, io_lib:format("~p~n", [Term])),
+	write_terms(Terms, File).
