@@ -2,40 +2,77 @@
 %% -*- erlang -*-
 %%! -smp enable -sname disk_log_converter
 
-main(Args) when (is_list(Args)) and (length(Args) == 2) ->
-	InFile = hd(Args),
-	[OutFile] = tl(Args),
-	convert_file(InFile, OutFile);
+% These are copied from disk_log.hrl in the kernel sources
+-define(LOGMAGIC, <<1,2,3,4>>). 
+-define(OPENED, <<6,7,8,9>>).
+-define(CLOSED, <<99,88,77,11>>).
+
+-define(BYTES_TO_READ, 500).
+
+main(Args) when (is_list(Args)) and (length(Args) >= 1) ->
+    convert(Args);
 
 main(_) -> 
 	usage().
 
 usage() ->
-	io:format("usage: disk_log_converter <log to convert> <file to write output to>~n"),
+	io:format("usage: disk_log_converter <log_file> [log_file2, log_file3, ...]~n"),
 	halt(1).
+
+convert([]) -> ok;
+convert([InFile | Files]) ->
+    convert_file(InFile, InFile ++ ".converted"),
+    convert(Files).
 
 convert_file(InFile, OutFile) -> 
 	io:format("Converting ~p from disk_log internal format to human-readable and outputing result to ~p~n", [InFile, OutFile]),
 	Log = case disk_log:open([{name, log},
 				   {file, InFile},
-				   {repair, true}]) of
-		{ok, L} -> L;
-		{repaired, L, _, _} -> L;
+				   {repair, true},
+                   {mode, read_only}]) of
+		{ok, L} -> {ok, L};
+		{repaired, L, Recovered, Bad} -> 
+            io:format("Repaired the log file. Recovered: ~p Bad: ~p~n", [Recovered, Bad]),
+            {ok, L};
+        {error, {not_a_log_file, _}} ->
+            io:format("WARNING: the file ~p does not have the appropriate header, prepending it and retrying.~n", [InFile]),
+            case file:open(InFile, [raw, binary, read, write]) of
+            {ok, Fd} -> 
+                file:pwrite(Fd, 0, [?LOGMAGIC, ?OPENED]),
+                file:close(Fd),
+                convert_file(InFile, OutFile),
+                ok;
+            {error, Reason} ->
+                io:format("ERROR: couldn't open the file to prepend the header. Reason ~p~n", [Reason]),
+                error
+            end;
 		Error -> 
 			io:format("ERROR: ~p~n", [Error]),
-			undefined
+			error
 		end,
-	{ok, File} = file:open(OutFile, [write]),
-	run_conversion(disk_log:chunk(Log, start), Log, File).
+    case Log of
+        error -> error;
+        {ok, LogAtom} -> 
+            {ok, File} = file:open(OutFile, [write]),
+            io:format("Starting conversion...~n"),
+            Chunk = disk_log:chunk(LogAtom, start),
+            run_conversion(Chunk, LogAtom, File)
+        end.
+
 
 run_conversion(eof, Log, File) ->
 	io:format("DONE~n"),
 	disk_log:close(Log),
 	file:close(File);
 
-run_conversion({Continuation, Terms}, Log, File) ->
+run_conversion({Continuation, Terms, BadBytes}, Log, File) ->
+    io:format("Found bad bytes in log file: ~p~n", [BadBytes]),
+    run_conversion({Continuation, Terms}, Log, File);
+
+run_conversion({Continuation, Terms}, Log, File)->
 	write_terms(Terms, File),
-	run_conversion(disk_log:chunk(Log, Continuation), Log, File).
+    Chunk = disk_log:chunk(Log, Continuation),
+	run_conversion(Chunk, Log, File).
 
 write_terms([], _) -> ok;
 write_terms([Term | Terms], File)->
